@@ -1,0 +1,149 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12455,6 +12455,9 @@
+         <message name="IDS_TAB_CXMENU_UNPIN_TAB" desc="The label of the tab context menu item for unpinning one or more tabs.">
+           Unpin
+         </message>
++        <message name="IDS_TAB_CXMENU_RESET_PINNED_URL" desc="The label of the tab context menu item for navigating a pinned tab back to the URL it was pinned at.">
++          Reset back to pinned URL
++        </message>
+         <message name="IDS_TAB_CXMENU_SOUND_MUTE_TAB" desc="The label of the tab context menu item for muting one or more tabs. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
+           {NUM_TABS, plural, =1 {Mute tab} other {Mute tabs}}
+         </message>
+@@ -12598,6 +12601,9 @@
+         <message name="IDS_TAB_CXMENU_UNPIN_TAB" desc="In Title Case: The label of the tab context menu item for unpinning one or more tabs.">
+           Unpin
+         </message>
++        <message name="IDS_TAB_CXMENU_RESET_PINNED_URL" desc="In Title Case: The label of the tab context menu item for navigating a pinned tab back to the URL it was pinned at.">
++          Reset back to pinned URL
++        </message>
+         <message name="IDS_TAB_CXMENU_SOUND_MUTE_TAB" desc="In Title Case: The label of the tab context menu item for muting one or more tabs. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
+           {NUM_TABS, plural, =1 {Mute Tab} other {Mute Tabs}}
+         </message>
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -510,6 +510,10 @@
+   AddItemWithStringId(
+       TabStripModel::CommandTogglePinned,
+       will_pin ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
++  if (!will_pin && num_tabs == 1) {
++    AddItemWithStringId(TabStripModel::CommandResetPinnedURL,
++                        IDS_TAB_CXMENU_RESET_PINNED_URL);
++  }
+ 
+   if (features::IsMenuSimplificationEnabled()) {
+     SetIconForCommandId(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -28,6 +28,7 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+@@ -113,6 +114,7 @@
+ #include "components/webapps/common/web_app_id.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/reload_type.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_widget_host.h"
+@@ -133,6 +135,38 @@
+ 
+ TabGroupModelFactory* factory_instance = nullptr;
+ 
++class PinnedUrlData : public base::SupportsUserData::Data {
++ public:
++  static constexpr char kKey[] = "helium.pinned_tab_url";
++
++  explicit PinnedUrlData(GURL url) : url_(std::move(url)) {}
++
++  static const GURL* Get(content::WebContents* contents) {
++    auto* data = static_cast<PinnedUrlData*>(contents->GetUserData(kKey));
++    return data ? &data->url_ : nullptr;
++  }
++
++  static void Sync(tabs::TabInterface* tab) {
++    content::WebContents* contents = tab->GetContents();
++    if (!tab->IsPinned()) {
++      contents->RemoveUserData(kKey);
++      return;
++    }
++
++    if (Get(contents)) {
++      return;
++    }
++
++    content::NavigationEntry* entry =
++        contents->GetController().GetLastCommittedEntry();
++    const GURL url = entry ? entry->GetURL() : contents->GetVisibleURL();
++    contents->SetUserData(kKey, std::make_unique<PinnedUrlData>(url));
++  }
++
++ private:
++  GURL url_;
++};
++
+ // Works similarly to base::AutoReset but checks for access from the wrong
+ // thread as well as ensuring that the previous value of the re-entrancy guard
+ // variable was false.
+@@ -2717,6 +2751,13 @@
+     case CommandTogglePinned:
+       return true;
+ 
++    case CommandResetPinnedURL: {
++      content::WebContents* contents = GetWebContentsAt(context_index);
++      const GURL* pinned_url = PinnedUrlData::Get(contents);
++      return pinned_url && pinned_url->is_valid() &&
++             *pinned_url != contents->GetLastCommittedURL();
++    }
++
+     case CommandToggleGrouped:
+       return SupportsTabGroups();
+ 
+@@ -3174,6 +3215,16 @@
+       break;
+     }
+ 
++    case CommandResetPinnedURL: {
++      base::RecordAction(UserMetricsAction("TabContextMenu_ResetPinnedURL"));
++      content::WebContents* contents = GetWebContentsAt(context_index);
++      if (const GURL* pinned_url = PinnedUrlData::Get(contents)) {
++        contents->GetController().LoadURLWithParams(
++            content::NavigationController::LoadURLParams(*pinned_url));
++      }
++      break;
++    }
++
+     case CommandCopyURL: {
+       std::vector<int> indices = GetIndicesForCommand(context_index);
+       base::UmaHistogramCounts1000("Tab.ContextMenu.CopyURL.SelectedTabsCount",
+@@ -5226,6 +5277,7 @@
+   }
+ 
+   if (initial_pinned_state != tab->IsPinned()) {
++    PinnedUrlData::Sync(tab);
+     for (auto& observer : observers_) {
+       observer.OnTabPinnedStateChanged(tab, final_index);
+     }
+@@ -5710,6 +5762,7 @@
+     }
+ 
+     if (notification.initial_pinned != tab->IsPinned()) {
++      PinnedUrlData::Sync(tab);
+       for (auto& observer : observers_) {
+         observer.OnTabPinnedStateChanged(tab, final_index);
+       }
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -42,6 +42,7 @@
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  CommandResetPinnedURL,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
